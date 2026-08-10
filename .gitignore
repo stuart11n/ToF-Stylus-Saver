@@ -1,0 +1,26 @@
+# Secrets / credentials
+**/secrets.h
+**/secrets.py
+.env
+.env.*
+
+# Firmware binaries
+*.bin
+*.elf
+*.hex
+
+# Nested third-party clones (use Library Manager / upstream instead)
+pololu-vl6180x-arduino/
+VL6180X_lib/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Arduino build artifacts
+**/build/
+**/libraries/
+.arduino*
