@@ -14,6 +14,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <esp_wifi.h>
 #include "secrets.h"
 
 static const int PIN_SDA = 8;
@@ -54,62 +55,110 @@ static void setLed(bool on) {
   digitalWrite(PIN_LED, on ? HIGH : LOW);
 }
 
+static void printMac(const uint8_t *mac) {
+  for (int i = 0; i < 6; i++) {
+    if (i) Serial.print(':');
+    if (mac[i] < 16) Serial.print('0');
+    Serial.print(mac[i], HEX);
+  }
+}
+
+// New locally-administered MAC each boot — avoids mesh client lockout
+// without restarting the mesh (our reconnect spam may have flagged the old MAC).
+static void useFreshStaMac() {
+  uint8_t mac[6];
+  // 0x02 = locally administered, unicast
+  mac[0] = 0x02;
+  mac[1] = 0xF6;
+  mac[2] = 0xEE;
+  uint32_t r = esp_random();
+  mac[3] = (r >> 16) & 0xFF;
+  mac[4] = (r >> 8) & 0xFF;
+  mac[5] = r & 0xFF;
+  esp_err_t err = esp_wifi_set_mac(WIFI_IF_STA, mac);
+  Serial.print("STA MAC ");
+  printMac(mac);
+  Serial.print(err == ESP_OK ? " OK" : " set_mac FAIL");
+  Serial.println();
+}
+
+static bool tryJoinBssid(uint8_t ch, const uint8_t *bssid, uint32_t timeout_ms) {
+  WiFi.disconnect(false, false);
+  delay(100);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD, ch, bssid);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeout_ms) {
+    delay(300);
+  }
+  return WiFi.status() == WL_CONNECTED;
+}
+
 static void connectWifi() {
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
+  WiFi.setMinSecurity(WIFI_AUTH_WPA_PSK);  // allow WPA/WPA2 mesh APs
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  useFreshStaMac();
   delay(100);
 
-  Serial.print("WiFi scan for ");
+  Serial.print("WiFi scan ");
   Serial.println(WIFI_SSID);
   int n = WiFi.scanNetworks(false, true);
-  int best = -1;
-  int32_t bestRssi = -999;
-  for (int i = 0; i < n; i++) {
-    if (WiFi.SSID(i) == WIFI_SSID && WiFi.RSSI(i) > bestRssi) {
-      bestRssi = WiFi.RSSI(i);
-      best = i;
+
+  // Collect s16n hits, sort by RSSI (simple selection each attempt)
+  struct ApHit {
+    int32_t rssi;
+    uint8_t ch;
+    uint8_t bssid[6];
+  };
+  ApHit hits[12];
+  int hitCount = 0;
+  for (int i = 0; i < n && hitCount < 12; i++) {
+    if (WiFi.SSID(i) != WIFI_SSID) continue;
+    hits[hitCount].rssi = WiFi.RSSI(i);
+    hits[hitCount].ch = WiFi.channel(i);
+    memcpy(hits[hitCount].bssid, WiFi.BSSID(i), 6);
+    hitCount++;
+  }
+  WiFi.scanDelete();
+
+  // Sort strongest first
+  for (int i = 0; i < hitCount; i++) {
+    for (int j = i + 1; j < hitCount; j++) {
+      if (hits[j].rssi > hits[i].rssi) {
+        ApHit tmp = hits[i];
+        hits[i] = hits[j];
+        hits[j] = tmp;
+      }
     }
   }
 
-  if (best < 0) {
+  Serial.print("mesh nodes with SSID: ");
+  Serial.println(hitCount);
+  if (hitCount == 0) {
     Serial.println("SSID not found");
-    WiFi.scanDelete();
     return;
   }
 
-  uint8_t *bssid = WiFi.BSSID(best);
-  uint8_t ch = WiFi.channel(best);
-  Serial.print("best RSSI=");
-  Serial.print(bestRssi);
-  Serial.print(" ch=");
-  Serial.print(ch);
-  Serial.print(" BSSID=");
-  for (int i = 0; i < 6; i++) {
-    if (i) Serial.print(':');
-    if (bssid[i] < 16) Serial.print('0');
-    Serial.print(bssid[i], HEX);
-  }
-  Serial.println();
-
-  // Lock to strongest AP — helps with mesh / multi-BSSID SSIDs
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD, ch, bssid);
-  WiFi.scanDelete();
-
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 30000) {
-    delay(400);
-    Serial.print(".");
-    Serial.print((int)WiFi.status());
-  }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("WiFi OK ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.print("WiFi FAILED status=");
+  for (int i = 0; i < hitCount; i++) {
+    Serial.print("try ");
+    printMac(hits[i].bssid);
+    Serial.print(" RSSI=");
+    Serial.print(hits[i].rssi);
+    Serial.print(" ch=");
+    Serial.print(hits[i].ch);
+    Serial.print(" ...");
+    if (tryJoinBssid(hits[i].ch, hits[i].bssid, 12000)) {
+      Serial.print(" OK ");
+      Serial.println(WiFi.localIP());
+      return;
+    }
+    Serial.print(" fail st=");
     Serial.println((int)WiFi.status());
   }
+
+  Serial.println("WiFi FAILED all mesh BSSIDs");
 }
 
 static bool ensureWifi() {
@@ -117,13 +166,7 @@ static bool ensureWifi() {
     return true;
   }
   Serial.println("WiFi reconnect...");
-  WiFi.disconnect(true, false);
-  delay(50);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
-    delay(300);
-  }
+  connectWifi();
   return WiFi.status() == WL_CONNECTED;
 }
 
