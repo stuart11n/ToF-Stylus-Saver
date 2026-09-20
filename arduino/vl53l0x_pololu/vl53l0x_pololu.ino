@@ -22,7 +22,7 @@ static const int PIN_SCL = 9;
 static const int PIN_XSHUT = 7;
 static const int PIN_LED = 15;
 
-static const uint16_t CAL_TRUE_MM = 25;
+static const uint16_t CAL_TRUE_MM = 40;
 static const int CAL_SAMPLES = 25;
 
 static const float ENTER_MM = 40.0f;
@@ -308,6 +308,7 @@ void setup() {
   setLed(false);
 
   Serial.begin(115200);
+  Serial.setTxTimeoutMs(0);  // USB CDC: don't stall TX if host opens late
   delay(800);
   Serial.println();
   Serial.println("VL53L0X proximity latch");
@@ -349,6 +350,9 @@ void loop() {
   }
 
   float mm = (float)readCorrectedMm();
+
+  Serial.print("mm=");
+  Serial.println(mm, 0);
 
   // LED: raw (unfiltered) threshold
   setLed(mm < ENTER_MM);
