@@ -1,19 +1,23 @@
-# LOLIN S2 Mini — VL53L4CD proximity + Shelly
+# ToF Stylus Saver
 
-Arduino firmware for a **LOLIN (Wemos) S2 Mini** with a **VL53L4CD** time-of-flight sensor.
+A **LOLIN (Wemos) S2 Mini** watches a **VL53L4CD** time-of-flight sensor and cuts a **Shelly** relay when something is close (stylus / obstacle in the beam). Firmware lives in `arduino/vl53l0x_pololu`.
 
-## Behavior (`arduino/vl53l0x_pololu`)
+Repo: [stuart11n/ToF-Stylus-Saver](https://github.com/stuart11n/ToF-Stylus-Saver)
 
-- **LED (GPIO15):** on when distance &lt; 40 mm (unfiltered / live)
-- **Shelly relay:** OFF on filtered obstacle latch, ON when clear (hysteresis + debounce)
-- **Web UI:** `http://<board-ip>/` shows Shelly host and lets you change it (saved in NVS; defaults from `SHELLY_HOST`)
-- **Pushover:** optional (wired in code; currently unused on the obstacle path)
-- **Offset calibration:** stored in NVS (`c` at 40 mm, `z` to clear)
+## Behavior
+
+- **LED (GPIO15):** on when live range &lt; 40 mm (unfiltered)
+- **Shelly:** OFF on filtered obstacle latch, ON when clear
+- **Web UI:** `http://<board-ip>/` shows and changes the Shelly host (saved in NVS; default from `SHELLY_HOST`)
+- **Serial:** prints `mm=` each sample; `c` / `z` / `1` / `0` as below
+- **Pushover:** wired in code, unused on the obstacle path
+
+VL53L4CD is specified down to ~1 mm (VL53L0X typically floors around 30 mm).
 
 ### Wiring
 
 | VL53L4CD | S2 Mini |
-|---------|---------|
+|----------|---------|
 | VIN / VCC | 3V3 |
 | GND | GND |
 | SDA | GPIO8 |
@@ -22,11 +26,9 @@ Arduino firmware for a **LOLIN (Wemos) S2 Mini** with a **VL53L4CD** time-of-fli
 
 ### Libraries
 
-Install via Arduino Library Manager / `arduino-cli`:
-
 - [VL53L4CD](https://github.com/pololu/vl53l4cd-arduino) (Pololu)
 
-Board: **LOLIN S2 Mini** (`esp32:esp32:lolin_s2_mini`), with USB CDC on boot enabled (default).
+Board: **LOLIN S2 Mini** (`esp32:esp32:lolin_s2_mini`), USB CDC on boot enabled (default).
 
 ### Build / flash
 
@@ -36,43 +38,42 @@ arduino-cli upload -p COMxx -b esp32:esp32:lolin_s2_mini arduino/vl53l0x_pololu
 arduino-cli monitor -p COMxx -c baudrate=115200
 ```
 
-On a board already running Arduino CDC, upload to the app port (auto 1200-baud reset). Otherwise: hold **0**, tap **RST**, release **0**, then upload to the bootloader port.
+If Arduino CDC is already running, upload to the app port (auto 1200-baud reset). Otherwise: hold **0**, tap **RST**, release **0**, then upload to the bootloader port.
 
 ### Serial commands
 
 | Key | Action |
 |-----|--------|
-| `c` | Offset calibrate at 40 mm |
+| `c` | Offset calibrate at 40 mm (hold a white target at 40 mm) |
 | `z` | Clear offset |
 | `1` / `0` | Shelly relay on / off |
 
-## `secrets.h` (required, not in git)
+After a full flash erase, run `c` again.
 
-Create local credentials from the example:
+### Robustness
+
+- I2C timeout 50 ms; after a streak of bad ranges the bus is clocked out, XSHUT is pulsed, and the sensor is re-inited
+- Shelly HTTP connect/read timeout 800 ms
+- WiFi: new STA MAC each boot and per-BSSID mesh join; ranging loop only does a short reconnect, not a full mesh rescan
+
+## `secrets.h` (required, not in git)
 
 ```bash
 cp arduino/vl53l0x_pololu/secrets.h.example arduino/vl53l0x_pololu/secrets.h
 ```
 
-Edit `arduino/vl53l0x_pololu/secrets.h`:
-
 | Symbol | Purpose |
 |--------|---------|
-| `WIFI_SSID` | 2.4 GHz Wi‑Fi network name |
+| `WIFI_SSID` | 2.4 GHz Wi‑Fi SSID |
 | `WIFI_PASSWORD` | Wi‑Fi password |
 | `PUSHOVER_USER` | Pushover user key ([pushover.net](https://pushover.net)) |
 | `PUSHOVER_TOKEN` | Pushover application API token |
-| `SHELLY_HOST` | Default Shelly IP (override anytime via the web UI; Gen1 `/relay/0?turn=` or Gen2 RPC fallback) |
+| `SHELLY_HOST` | Default Shelly IP (change later in the web UI) |
 
-**Do not commit `secrets.h`.** It is listed in `.gitignore`. Only `secrets.h.example` (placeholders) is tracked.
+**Do not commit `secrets.h`.** Only `secrets.h.example` is tracked.
 
 ## Other sketches / MicroPython
 
-- `arduino/vl6180x_pololu` — earlier Pololu VL6180X test (that module’s near-range was unusable)
+- `arduino/vl6180x_pololu` — earlier VL6180X test (near-range was unusable)
 - `arduino/wifi_diag` — Wi‑Fi scan / join diagnostics
-- `src/` — earlier MicroPython experiments (use a local `secrets.py`; also gitignored)
-
-## Notes
-
-- VL53L4CD is specified down to ~1 mm (unlike VL53L0X, which floors around 30 mm).
-- After a full flash erase, re-run offset calibration (`c`).
+- `src/` — earlier MicroPython experiments (local `secrets.py`; gitignored)
