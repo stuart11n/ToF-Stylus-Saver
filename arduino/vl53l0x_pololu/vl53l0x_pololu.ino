@@ -1,19 +1,21 @@
 /*
- * Pololu VL53L0X on LOLIN S2 Mini — proximity latch + Pushover
+ * Pololu VL53L4CD on LOLIN S2 Mini — proximity latch + Pushover
  * Wiring: SDA=8 SCL=9 XSHUT=7 VIN=3V3 GND=GND
  * LED: GPIO15 (onboard)
  *
- * LED: immediate (<40mm on, else off) — no filter/debounce.
+ * LED: immediate (<ENTER_MM on, else off) — no filter/debounce.
  * Filtered latch: Shelly OFF on OBSTACLE, ON on CLEAR (Pushover disabled).
+ * Web UI: http://<board-ip>/ — view/change Shelly host (stored in NVS).
  * Serial: 'c' cal, 'z' clear offset, '1'/'0' Shelly on/off
  */
 
 #include <Wire.h>
-#include <VL53L0X.h>
+#include <VL53L4CD.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
 #include <esp_wifi.h>
 #include "secrets.h"
 
@@ -26,16 +28,24 @@ static const uint16_t CAL_TRUE_MM = 40;
 static const int CAL_SAMPLES = 25;
 
 static const float ENTER_MM = 40.0f;
-static const float EXIT_MM = 50.0f;
+static const float EXIT_MM = 40.0f;
 
 static const float EMA_ALPHA = 0.08f;
 static const int ENTER_STREAK = 8;
 static const int EXIT_STREAK = 10;
 static const uint16_t SAMPLE_MS = 40;
+static const uint16_t I2C_TIMEOUT_MS = 50;
+static const uint16_t HTTP_TIMEOUT_MS = 800;
+static const int RANGE_FAIL_RECOVER = 12;
 
-VL53L0X sensor;
+VL53L4CD sensor;
 Preferences prefs;
+WebServer server(80);
 int16_t range_offset_mm = 0;
+char shelly_host[64];
+bool web_started = false;
+int range_fail_streak = 0;
+uint32_t last_wifi_try_ms = 0;
 
 float filt_mm = 1000.0f;
 bool filt_init = false;
@@ -43,12 +53,126 @@ bool obstacle = false;
 int below_streak = 0;
 int above_streak = 0;
 
+static void loadShellyHost() {
+  String saved = prefs.getString("shelly", "");
+  saved.trim();
+  if (saved.length() == 0 || saved.length() >= (int)sizeof(shelly_host)) {
+    strncpy(shelly_host, SHELLY_HOST, sizeof(shelly_host) - 1);
+  } else {
+    strncpy(shelly_host, saved.c_str(), sizeof(shelly_host) - 1);
+  }
+  shelly_host[sizeof(shelly_host) - 1] = '\0';
+}
+
+static bool saveShellyHost(const String &host) {
+  String h = host;
+  h.trim();
+  if (h.length() < 1 || h.length() >= (int)sizeof(shelly_host)) {
+    return false;
+  }
+  strncpy(shelly_host, h.c_str(), sizeof(shelly_host) - 1);
+  shelly_host[sizeof(shelly_host) - 1] = '\0';
+  prefs.putString("shelly", shelly_host);
+  return true;
+}
+
+static void handleRoot() {
+  String html;
+  html.reserve(900);
+  html += F("<!DOCTYPE html><html><head><meta charset=utf-8>"
+            "<meta name=viewport content=\"width=device-width,initial-scale=1\">"
+            "<title>S2 Mini Shelly</title>"
+            "<style>"
+            "body{font-family:system-ui,sans-serif;max-width:28rem;margin:2rem auto;padding:0 1rem}"
+            "label{display:block;margin:.5rem 0 .25rem}"
+            "input[type=text]{width:100%;box-sizing:border-box;padding:.5rem;font-size:1rem}"
+            "button{margin-top:1rem;padding:.5rem 1rem;font-size:1rem}"
+            ".meta{color:#555;font-size:.9rem;margin-top:1.5rem}"
+            "</style></head><body>"
+            "<h1>Shelly host</h1>"
+            "<form method=POST action=/save>"
+            "<label for=host>IP or hostname</label>"
+            "<input id=host name=host type=text value=\"");
+  html += shelly_host;
+  html += F("\" required maxlength=63>"
+            "<button type=submit>Save</button>"
+            "</form><p class=meta>Board ");
+  html += WiFi.localIP().toString();
+  html += F("</p></body></html>");
+  server.send(200, "text/html", html);
+}
+
+static void handleSave() {
+  if (!server.hasArg("host") || !saveShellyHost(server.arg("host"))) {
+    server.send(400, "text/plain", "bad host");
+    return;
+  }
+  Serial.print("Shelly host -> ");
+  Serial.println(shelly_host);
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+static void startWebUi() {
+  if (web_started) {
+    return;
+  }
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.begin();
+  web_started = true;
+  Serial.print("Web UI http://");
+  Serial.print(WiFi.localIP());
+  Serial.println("/");
+}
+
 static void xshutReset() {
   pinMode(PIN_XSHUT, OUTPUT);
   digitalWrite(PIN_XSHUT, LOW);
   delay(10);
   digitalWrite(PIN_XSHUT, HIGH);
   delay(10);
+}
+
+static void i2cBegin() {
+  Wire.begin(PIN_SDA, PIN_SCL);
+  Wire.setClock(400000);
+  Wire.setTimeOut(I2C_TIMEOUT_MS);
+}
+
+// Unstick SDA-held-low (classic ToF/I2C hang), then re-init the bus.
+static void i2cRecover() {
+  Wire.end();
+  pinMode(PIN_SDA, INPUT_PULLUP);
+  pinMode(PIN_SCL, OUTPUT);
+  digitalWrite(PIN_SCL, HIGH);
+  delayMicroseconds(5);
+  for (int i = 0; i < 9 && digitalRead(PIN_SDA) == LOW; i++) {
+    digitalWrite(PIN_SCL, LOW);
+    delayMicroseconds(5);
+    digitalWrite(PIN_SCL, HIGH);
+    delayMicroseconds(5);
+  }
+  pinMode(PIN_SDA, OUTPUT);
+  digitalWrite(PIN_SDA, LOW);
+  delayMicroseconds(5);
+  digitalWrite(PIN_SCL, HIGH);
+  delayMicroseconds(5);
+  digitalWrite(PIN_SDA, HIGH);
+  delayMicroseconds(5);
+  xshutReset();
+  i2cBegin();
+}
+
+static bool sensorStart() {
+  xshutReset();
+  sensor.setTimeout(200);
+  if (!sensor.init()) {
+    return false;
+  }
+  sensor.setRangeTiming(20, 0);
+  sensor.startContinuous();
+  return true;
 }
 
 static void setLed(bool on) {
@@ -161,13 +285,28 @@ static void connectWifi() {
   Serial.println("WiFi FAILED all mesh BSSIDs");
 }
 
+// Do not run a full mesh scan from the ranging loop — that can stall for tens of seconds.
 static bool ensureWifi() {
   if (WiFi.status() == WL_CONNECTED) {
+    startWebUi();
     return true;
   }
-  Serial.println("WiFi reconnect...");
-  connectWifi();
-  return WiFi.status() == WL_CONNECTED;
+  uint32_t now = millis();
+  if (now - last_wifi_try_ms < 5000) {
+    return false;
+  }
+  last_wifi_try_ms = now;
+  Serial.println("WiFi quick reconnect...");
+  WiFi.reconnect();
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 1500) {
+    delay(50);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    startWebUi();
+    return true;
+  }
+  return false;
 }
 
 // Shelly Gen1 HTTP API; falls back to Gen2 RPC if needed
@@ -178,13 +317,15 @@ static bool setShellyRelay(bool on) {
   }
 
   HTTPClient http;
-  String url = String("http://") + SHELLY_HOST + "/relay/0?turn=";
+  String url = String("http://") + shelly_host + "/relay/0?turn=";
   url += on ? "on" : "off";
 
   if (!http.begin(url)) {
     Serial.println("Shelly: begin failed");
     return false;
   }
+  http.setConnectTimeout(HTTP_TIMEOUT_MS);
+  http.setTimeout(HTTP_TIMEOUT_MS);
   int code = http.GET();
   String resp = http.getString();
   http.end();
@@ -200,12 +341,14 @@ static bool setShellyRelay(bool on) {
   }
 
   // Gen2 fallback: Switch.Set
-  url = String("http://") + SHELLY_HOST + "/rpc/Switch.Set?id=0&on=";
+  url = String("http://") + shelly_host + "/rpc/Switch.Set?id=0&on=";
   url += on ? "true" : "false";
   if (!http.begin(url)) {
     Serial.println("Shelly Gen2: begin failed");
     return false;
   }
+  http.setConnectTimeout(HTTP_TIMEOUT_MS);
+  http.setTimeout(HTTP_TIMEOUT_MS);
   code = http.GET();
   resp = http.getString();
   http.end();
@@ -232,6 +375,8 @@ static bool sendPushover(const char *title, const char *message) {
     Serial.println("Pushover: begin failed");
     return false;
   }
+  https.setConnectTimeout(HTTP_TIMEOUT_MS);
+  https.setTimeout(HTTP_TIMEOUT_MS);
 
   https.addHeader("Content-Type", "application/x-www-form-urlencoded");
 
@@ -255,13 +400,21 @@ static bool sendPushover(const char *title, const char *message) {
   return code == 200;
 }
 
+static bool last_range_ok = false;
+
 static uint16_t readRawMm() {
-  return sensor.readRangeSingleMillimeters();
+  uint16_t mm = sensor.read();
+  // range_status 0 = valid (UM2931)
+  last_range_ok = !sensor.timeoutOccurred() && sensor.ranging_data.range_status == 0;
+  if (!last_range_ok) {
+    return 8190;
+  }
+  return mm;
 }
 
 static uint16_t readCorrectedMm() {
   uint16_t raw = readRawMm();
-  if (sensor.timeoutOccurred()) {
+  if (!last_range_ok) {
     return 8190;
   }
   int v = (int)raw - (int)range_offset_mm;
@@ -279,7 +432,7 @@ static bool calibrateOffset(uint16_t true_mm) {
   int good = 0;
   for (int i = 0; i < CAL_SAMPLES; i++) {
     uint16_t mm = readRawMm();
-    if (!sensor.timeoutOccurred() && mm >= 15 && mm <= 2000) {
+    if (last_range_ok && mm >= 1 && mm <= 1300) {
       sum += mm;
       good++;
       Serial.print("  ");
@@ -311,29 +464,42 @@ void setup() {
   Serial.setTxTimeoutMs(0);  // USB CDC: don't stall TX if host opens late
   delay(800);
   Serial.println();
-  Serial.println("VL53L0X proximity latch");
-
-  connectWifi();
-
-  xshutReset();
-  Wire.begin(PIN_SDA, PIN_SCL);
-  Wire.setClock(400000);
-
-  sensor.setTimeout(500);
-  if (!sensor.init()) {
-    Serial.println("INIT FAIL");
-    while (1) delay(1000);
-  }
-  sensor.setMeasurementTimingBudget(33000);
+  Serial.println("VL53L4CD proximity latch");
 
   prefs.begin("vl53", false);
   range_offset_mm = prefs.getShort("offset", 0);
+  loadShellyHost();
   Serial.print("offset=");
   Serial.println(range_offset_mm);
-  Serial.println("Ready — LED live <40mm; Shelly latch on filtered OBSTACLE/CLEAR");
+  Serial.print("Shelly host=");
+  Serial.println(shelly_host);
+
+  connectWifi();
+  if (WiFi.status() == WL_CONNECTED) {
+    startWebUi();
+  }
+
+  i2cBegin();
+  bool inited = false;
+  for (int i = 0; i < 5 && !inited; i++) {
+    inited = sensorStart();
+    if (!inited) {
+      Serial.println("INIT FAIL, I2C recover");
+      i2cRecover();
+    }
+  }
+  if (!inited) {
+    Serial.println("INIT FAIL — will retry in loop");
+  }
+
+  Serial.print("Ready — LED live <");
+  Serial.print(ENTER_MM, 0);
+  Serial.println("mm; Shelly latch on filtered OBSTACLE/CLEAR");
 }
 
 void loop() {
+  server.handleClient();
+
   while (Serial.available()) {
     char ch = (char)Serial.read();
     if (ch == 'c' || ch == 'C') {
@@ -351,8 +517,25 @@ void loop() {
 
   float mm = (float)readCorrectedMm();
 
+  if (last_range_ok) {
+    range_fail_streak = 0;
+  } else {
+    range_fail_streak++;
+    if (range_fail_streak >= RANGE_FAIL_RECOVER) {
+      Serial.println("range fail streak — I2C recover");
+      i2cRecover();
+      sensorStart();
+      range_fail_streak = 0;
+    }
+  }
+
   Serial.print("mm=");
-  Serial.println(mm, 0);
+  Serial.print(mm, 0);
+  if (!last_range_ok) {
+    Serial.print(" st=");
+    Serial.print(sensor.ranging_data.range_status);
+  }
+  Serial.println();
 
   // LED: raw (unfiltered) threshold
   setLed(mm < ENTER_MM);
